@@ -112,6 +112,38 @@ module_blocked() {
     return 1
 }
 
+# Print, one per line, the modprobe.d files that block this module.
+# Empty output if none. Deduplicated across the install/blacklist patterns.
+module_blocked_by() {
+    local mod="$1"
+    [[ -d "$MODPROBE_DIR" ]] || return 0
+    {
+        grep -rEsl "^[[:space:]]*install[[:space:]]+${mod}[[:space:]]+(/usr)?/(s)?bin/(false|true)\b" \
+            "$MODPROBE_DIR" 2>/dev/null || true
+        grep -rEsl "^[[:space:]]*blacklist[[:space:]]+${mod}\b" \
+            "$MODPROBE_DIR" 2>/dev/null || true
+    } | sort -u
+}
+
+# Print informational lines describing pre-existing blocks for the given modules.
+# Excludes the script's own designated config files, since those have their own
+# "already exists" messaging path. Silent for modules with no existing block.
+report_existing_blocks() {
+    local mod files f
+    for mod in "$@"; do
+        module_blocked "$mod" || continue
+        files="$(module_blocked_by "$mod")"
+        [[ -n "$files" ]] || continue
+        # Filter out our own config files
+        files="$(printf '%s\n' "$files" | grep -vxF "$COPYFAIL_CONF" | grep -vxF "$DIRTYFRAG_CONF" || true)"
+        [[ -n "$files" ]] || continue
+        info "$mod is already blocked by:"
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && info "    $f"
+        done <<< "$files"
+    done
+}
+
 # Returns one of: ABSENT, BLOCKED_UNLOADED, BLOCKED_LOADED, LOADED, LOADABLE
 module_status() {
     local mod="$1"
@@ -307,8 +339,11 @@ EOF
         return 0
     fi
     require_root
+    report_existing_blocks algif_aead
     if [[ -f "$COPYFAIL_CONF" ]]; then
         warn "$COPYFAIL_CONF already exists - leaving as-is."
+    elif module_blocked algif_aead; then
+        info "Not writing a redundant config. Will still attempt to unload now."
     else
         write_conf "$COPYFAIL_CONF" algif_aead
         ok "Wrote $COPYFAIL_CONF"
@@ -340,8 +375,12 @@ EOF
         return 0
     fi
     require_root
+    report_existing_blocks esp4 esp6 rxrpc
     if [[ -f "$DIRTYFRAG_CONF" ]]; then
         warn "$DIRTYFRAG_CONF already exists - leaving as-is."
+    elif module_blocked esp4 && module_blocked esp6 && module_blocked rxrpc; then
+        info "All Dirty Frag modules already blocked elsewhere."
+        info "Not writing a redundant config. Will still attempt to unload now."
     else
         write_conf "$DIRTYFRAG_CONF" esp4 esp6 rxrpc
         ok "Wrote $DIRTYFRAG_CONF"
