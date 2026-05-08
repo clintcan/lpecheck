@@ -17,19 +17,24 @@
 set -euo pipefail
 
 readonly SCRIPT_VERSION="1.0"
-readonly SCRIPT_NAME="$(basename "$0")"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
 readonly MODPROBE_DIR="/etc/modprobe.d"
 readonly COPYFAIL_CONF="${MODPROBE_DIR}/disable-copyfail.conf"
 readonly DIRTYFRAG_CONF="${MODPROBE_DIR}/disable-dirtyfrag.conf"
 readonly OWNER_TAG="# Managed-by: ${SCRIPT_NAME} v${SCRIPT_VERSION}"
+# OWNER_MATCH is the prefix used to recognize files written by ANY version of
+# this script during rollback. New versions can change OWNER_TAG freely without
+# orphaning files written by older versions.
+readonly OWNER_MATCH="# Managed-by: ${SCRIPT_NAME}"
 
 # ---------- output helpers ----------
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
-    BOLD=$(tput bold); DIM=$(tput dim); RESET=$(tput sgr0)
+    BOLD=$(tput bold); RESET=$(tput sgr0)
     RED=$(tput setaf 1); GREEN=$(tput setaf 2)
     YELLOW=$(tput setaf 3); BLUE=$(tput setaf 4)
 else
-    BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""; BLUE=""
+    BOLD=""; RESET=""; RED=""; GREEN=""; YELLOW=""; BLUE=""
 fi
 
 info()   { printf '%s[*]%s %s\n' "$BLUE"   "$RESET" "$*"; }
@@ -71,6 +76,17 @@ module_present() {
 # /sys/module/<mod> exists for both LKM-loaded and built-in modules).
 module_loaded() {
     [[ -d "/sys/module/$1" ]]
+}
+
+# 0 if module is built into the kernel (not a loadable module).
+# Built-in modules cannot be unloaded and modprobe.d does NOT control them.
+module_is_builtin() {
+    local mod="$1"
+    [[ -d "/sys/module/$mod" ]] || return 1
+    local fname
+    fname="$(modinfo -F filename -- "$mod" 2>/dev/null || true)"
+    # modinfo prints "(builtin)" for built-ins, or empty/error if unknown
+    [[ -z "$fname" || "$fname" == "(builtin)" ]]
 }
 
 # refcount of a loaded module (-1 if not loaded)
@@ -248,19 +264,28 @@ write_conf() {
 
 unload_modules_best_effort() {
     # Attempt to unload modules; do not fail the script if a module is in use.
+    # Loudly warn if a module is built-in, since modprobe.d does NOT block
+    # built-in modules and the user is NOT actually protected by this script.
     for mod in "$@"; do
-        if module_loaded "$mod"; then
-            local rc
-            rc="$(module_refcount "$mod")"
-            if [[ "$rc" -gt 0 ]]; then
-                warn "$mod is in use (refcnt=$rc); cannot unload now. Reboot to fully clear."
-                continue
-            fi
-            if rmmod "$mod" 2>/dev/null; then
-                ok "Unloaded $mod."
-            else
-                warn "Could not unload $mod (may be built-in or busy). Reboot to fully clear."
-            fi
+        if ! module_loaded "$mod"; then
+            continue
+        fi
+        if module_is_builtin "$mod"; then
+            warn "$mod is BUILT INTO THE KERNEL on this system."
+            warn "  modprobe.d cannot block built-in modules. This mitigation"
+            warn "  does NOT protect you for $mod. Only a kernel patch will."
+            continue
+        fi
+        local rc
+        rc="$(module_refcount "$mod")"
+        if [[ "$rc" -gt 0 ]]; then
+            warn "$mod is in use (refcnt=$rc); cannot unload now. Reboot to fully clear."
+            continue
+        fi
+        if rmmod "$mod" 2>/dev/null; then
+            ok "Unloaded $mod."
+        else
+            warn "Could not unload $mod (busy or unexpected). Reboot to fully clear."
         fi
     done
 }
@@ -333,7 +358,7 @@ rollback_one() {
         info "$path not present - nothing to remove."
         return 0
     fi
-    if ! grep -qF "$OWNER_TAG" "$path" 2>/dev/null; then
+    if ! grep -qF "$OWNER_MATCH" "$path" 2>/dev/null; then
         warn "$path is NOT tagged as managed by this script. Refusing to remove."
         warn "If you want to remove it, do so manually."
         return 1
