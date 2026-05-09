@@ -1,0 +1,73 @@
+id: dirty-frag-linux-kernel-lpe
+
+info:
+  name: Linux Kernel Dirty Frag — xfrm-ESP / RxRPC LPE
+  author: lpe-check
+  severity: high
+  description: Detects exposure to Dirty Frag
+  classification:
+    cvss-score: 7.8
+    cvss-metrics: CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H
+
+self-contained: true
+
+code:
+  - engine:
+      - sh
+      - bash
+    source: |
+      kernel="$(uname -r)"
+      any_vulnerable=0
+      report=""
+      check_module() {
+        mod="$1"
+        [ -d "/sys/module/$mod" ] && loaded=1 || loaded=0
+        modinfo -n -- "$mod" >/dev/null 2>&1 && loadable=1 || loadable=0
+        blocked=0
+        if [ -d /etc/modprobe.d ]; then
+          if grep -rEsq "^[[:space:]]*install[[:space:]]+${mod}[[:space:]]+(/usr)?/(s)?bin/(false|true)" /etc/modprobe.d 2>/dev/null \
+             || grep -rEsq "^[[:space:]]*blacklist[[:space:]]+${mod}" /etc/modprobe.d 2>/dev/null; then
+            blocked=1
+          fi
+        fi
+        if [ "$loaded" = "1" ] && [ "$blocked" = "0" ]; then
+          report="${report}MODULE=$mod state=loaded blacklisted=no; "
+          any_vulnerable=1
+        elif [ "$loaded" = "1" ] && [ "$blocked" = "1" ]; then
+          report="${report}MODULE=$mod state=loaded blacklisted=yes_but_still_loaded; "
+          any_vulnerable=1
+        elif [ "$loadable" = "1" ] && [ "$blocked" = "0" ]; then
+          report="${report}MODULE=$mod state=loadable blacklisted=no; "
+          any_vulnerable=1
+        elif [ "$loadable" = "0" ] && [ "$loaded" = "0" ]; then
+          report="${report}MODULE=$mod state=absent; "
+        else
+          report="${report}MODULE=$mod state=unloaded blacklisted=yes; "
+        fi
+      }
+      check_module esp4
+      check_module esp6
+      check_module rxrpc
+      ipsec_active=no
+      if command -v ip >/dev/null 2>&1; then
+        if [ -n "$(ip xfrm state 2>/dev/null)" ]; then
+          ipsec_active=yes
+        fi
+      fi
+      if [ "$any_vulnerable" = "1" ]; then
+        echo "STATUS=VULNERABLE kernel=$kernel ipsec_active=$ipsec_active ${report}"
+      else
+        echo "STATUS=NOT_AFFECTED kernel=$kernel ipsec_active=$ipsec_active ${report}"
+      fi
+    matchers:
+      - type: word
+        words:
+          - "STATUS=VULNERABLE"
+    extractors:
+      - type: dsl
+        dsl:
+          - response
+      - type: regex
+        name: vulnerable_modules
+        regex:
+          - "MODULE=\\w+ state=\\w+( blacklisted=\\w+)?"
