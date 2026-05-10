@@ -13,8 +13,21 @@ Both are deterministic logic bugs that let an unprivileged local user gain root 
 
 1. **Detects** whether your kernel is exposed by checking the status of four kernel modules: `algif_aead` (Copy Fail), `esp4`, `esp6`, and `rxrpc` (Dirty Frag).
 2. **Checks active use** of IPsec (`ip xfrm state`) and AFS/`rxrpc` so it can warn you *before* applying mitigations that would tear down a running service.
-3. **Applies mitigations** with explicit per-vulnerability confirmation, writing tagged files to `/etc/modprobe.d/` and best-effort unloading the affected modules.
-4. **Rolls back** safely — only files this script created (identified by a header tag) can be removed via `--rollback`. Hand-written admin configs at the same paths are left untouched.
+3. **Verifies patch status** heuristically by reading the kernel package's local changelog and the kernel build date, to reduce false positives where a distro shipped a fix without removing the module. See "Patch verification" below.
+4. **Applies mitigations** with explicit per-vulnerability confirmation, writing tagged files to `/etc/modprobe.d/` and best-effort unloading the affected modules.
+5. **Rolls back** safely — only files this script created (identified by a header tag) can be removed via `--rollback`. Hand-written admin configs at the same paths are left untouched.
+
+## Patch verification
+
+A naive check based purely on module presence produces false positives whenever a distribution backports a CVE fix without removing the vulnerable module — the bug is gone but the module file remains, and a check that only looks at `/sys/module/` and `modinfo` would still flag the host. The script combines two additional signals to catch this case:
+
+**Kernel package changelog (high confidence).** Distros reference CVE IDs in the kernel package changelog when shipping a fix. The script reads the locally-installed changelog (no network: tries `/usr/share/doc/linux-image-*/changelog.Debian.gz` for Debian/Ubuntu, then `rpm -q --changelog kernel-*` for RHEL/Fedora/SUSE) and looks for `CVE-2026-31431` or `Dirty Frag`. A hit here overrides the module-based "exposed" verdict — if the changelog confirms the fix, the verdict downgrades to "not exposed".
+
+**Kernel build date (medium confidence).** If the kernel was built after the patch window opened (Copy Fail disclosure + 14 days = 2026-05-13; Dirty Frag = 2026-05-21), it almost certainly includes the fix. The script parses `uname -v` for the build date. A hit here is reported but does *not* override the module-based verdict — it's a heuristic, and you might still want to apply the temporary mitigation while you confirm.
+
+The "Patch verification" output line tells you which signal fired. If neither signal fires and the module is present, the host is treated as exposed.
+
+This addition turns the verdict from "module present, therefore vulnerable" into "module present AND no patch evidence, therefore probably vulnerable." It's not perfect — distros that ship fixes without referencing the CVE in the changelog will still produce a false positive — but it eliminates the most common case.
 
 ## Requirements
 

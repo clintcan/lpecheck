@@ -192,11 +192,69 @@ afs_mounted() {
     grep -qE '\bafs\b' /proc/mounts 2>/dev/null
 }
 
+# ---------- patch verification (false-positive reduction) ----------
+# These functions look for evidence that the running kernel includes a fix
+# for the CVE, independent of whether the vulnerable module is loaded. They
+# turn "module present, therefore vulnerable" into "module present AND no
+# patch evidence, therefore probably vulnerable."
+#
+# Both signals are heuristic. A negative result means "no patch evidence
+# found", not "definitely unpatched". A positive changelog hit is high
+# confidence; a positive build-date hit is medium confidence.
+
+# Print the running kernel's build time as a Unix epoch, or empty on failure.
+# uname -v formats vary, e.g.
+#   "#101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023"
+#   "#2 SMP PREEMPT_DYNAMIC Wed Jan 14 17:56:08 UTC 2026"
+# Extract from the first day-of-week token onward and feed that to date -d.
+kernel_build_epoch() {
+    local v date_str
+    v="$(uname -v 2>/dev/null)" || return 0
+    date_str="$(printf '%s' "$v" | grep -oE '(Sun|Mon|Tue|Wed|Thu|Fri|Sat) .*')" || return 0
+    [[ -n "$date_str" ]] || return 0
+    date -d "$date_str" +%s 2>/dev/null || true
+}
+
+# 0 if the running kernel was built on or after $1 (date string `date -d` accepts).
+kernel_built_on_or_after() {
+    local target="$1" target_epoch build_epoch
+    target_epoch="$(date -d "$target" +%s 2>/dev/null)" || return 1
+    build_epoch="$(kernel_build_epoch)"
+    [[ -n "$build_epoch" ]] || return 1
+    (( build_epoch >= target_epoch ))
+}
+
+# 0 if the running kernel package's changelog mentions $1 (case-insensitive,
+# fixed string). Tries Debian/Ubuntu doc paths first, then rpm changelogs.
+# Network-free; works only with locally-installed changelogs.
+kernel_changelog_mentions() {
+    local needle="$1" kver loc pkg
+    kver="$(uname -r)"
+    for loc in \
+        "/usr/share/doc/linux-image-$kver/changelog.Debian.gz" \
+        "/usr/share/doc/linux-image-$kver/changelog.gz" \
+        "/usr/share/doc/linux-image-unsigned-$kver/changelog.Debian.gz" \
+        "/usr/share/doc/linux-modules-$kver/changelog.Debian.gz" \
+    ; do
+        if [[ -r "$loc" ]]; then
+            zcat -- "$loc" 2>/dev/null | grep -qiF -- "$needle" && return 0
+        fi
+    done
+    if command -v rpm >/dev/null 2>&1; then
+        for pkg in "kernel-$kver" "kernel-core-$kver" "kernel-default-$kver"; do
+            rpm -q --changelog -- "$pkg" 2>/dev/null | grep -qiF -- "$needle" && return 0
+        done
+    fi
+    return 1
+}
+
 # ---------- detection summary ----------
 
 declare -A MOD_STATUS
 COPYFAIL_EXPOSED=0
 DIRTYFRAG_EXPOSED=0
+COPYFAIL_PATCH_EVIDENCE=""
+DIRTYFRAG_PATCH_EVIDENCE=""
 
 run_detection() {
     header "System information"
@@ -240,17 +298,82 @@ run_detection() {
         RXRPC_ACTIVE=0
     fi
 
+    header "Patch verification (heuristic)"
+    # Disclosed dates: Copy Fail 2026-04-29, Dirty Frag 2026-05-07.
+    # Distro patches typically ship within ~2 weeks of disclosure; use disclosure
+    # date + 14 days as the threshold for "kernel built late enough to likely
+    # include the fix". Changelog hits are higher confidence than build-date.
+    if kernel_changelog_mentions "CVE-2026-31431"; then
+        ok "Copy Fail patch confirmed: CVE-2026-31431 referenced in kernel changelog."
+        COPYFAIL_PATCH_EVIDENCE="changelog"
+    elif kernel_built_on_or_after "2026-05-13"; then
+        info "Copy Fail: kernel built after patch window opened (likely patched, not confirmed)."
+        COPYFAIL_PATCH_EVIDENCE="build-date"
+    else
+        info "Copy Fail: no patch evidence found in kernel metadata."
+    fi
+    # Dirty Frag has no CVE assigned at the time of writing. Match in
+    # priority order:
+    #   HIGH confidence (overrides module-based verdict): disclosure name
+    #   or discoverer references — these are unique to this CVE.
+    #     - "Dirty Frag" / "dirty-frag" / "dirtyfrag"
+    #     - the discoverer's name and GitHub repo path
+    #     - the eventual CVE ID once assigned (add a kernel_changelog_mentions
+    #       line below when known).
+    #   MEDIUM confidence (does NOT override): subsystem markers like
+    #   "MSG_SPLICE_PAGES" + esp/rxrpc — strongly correlated with this fix
+    #   but could in principle match an unrelated commit touching the same
+    #   files. Surfaced for visibility only.
+    #   LOW confidence (does NOT override): build date past patch window.
+    # Add upstream commit SHAs at HIGH tier once they are published.
+    if   kernel_changelog_mentions "dirty frag"     \
+      || kernel_changelog_mentions "dirty-frag"     \
+      || kernel_changelog_mentions "dirtyfrag"      \
+      || kernel_changelog_mentions "v4bel/dirtyfrag" \
+      || kernel_changelog_mentions "Hyunwoo Kim"; then
+        ok "Dirty Frag patch confirmed: disclosure name referenced in kernel changelog."
+        DIRTYFRAG_PATCH_EVIDENCE="changelog"
+    elif kernel_changelog_mentions "MSG_SPLICE_PAGES" \
+         && (   kernel_changelog_mentions "esp4"   \
+             || kernel_changelog_mentions "esp6"   \
+             || kernel_changelog_mentions "rxrpc"); then
+        info "Dirty Frag: subsystem markers found in changelog (MSG_SPLICE_PAGES + ESP/rxrpc);"
+        info "  this is consistent with the patch but is not definitive. Not overriding verdict."
+        DIRTYFRAG_PATCH_EVIDENCE="subsystem-marker"
+    elif kernel_built_on_or_after "2026-05-21"; then
+        info "Dirty Frag: kernel built after patch window opened (likely patched, not confirmed)."
+        DIRTYFRAG_PATCH_EVIDENCE="build-date"
+    else
+        info "Dirty Frag: no patch evidence found in kernel metadata."
+    fi
+
+    # High-confidence changelog evidence overrides module-presence verdict.
+    # Build-date evidence is shown but does NOT override (still flagged exposed).
+    if (( COPYFAIL_EXPOSED )) && [[ "$COPYFAIL_PATCH_EVIDENCE" == "changelog" ]]; then
+        COPYFAIL_EXPOSED=0
+    fi
+    if (( DIRTYFRAG_EXPOSED )) && [[ "$DIRTYFRAG_PATCH_EVIDENCE" == "changelog" ]]; then
+        DIRTYFRAG_EXPOSED=0
+    fi
+
     header "Exposure summary"
-    if (( COPYFAIL_EXPOSED )); then
-        printf '  %sCopy Fail  (CVE-2026-31431):%s exposed\n' "$RED" "$RESET"
-    else
-        printf '  %sCopy Fail  (CVE-2026-31431):%s not exposed\n' "$GREEN" "$RESET"
-    fi
-    if (( DIRTYFRAG_EXPOSED )); then
-        printf '  %sDirty Frag                 :%s exposed\n' "$RED" "$RESET"
-    else
-        printf '  %sDirty Frag                 :%s not exposed\n' "$GREEN" "$RESET"
-    fi
+    print_verdict() {
+        local label="$1" exposed="$2" evidence="$3"
+        if (( exposed )); then
+            local note=""
+            case "$evidence" in
+                build-date)        note=" (kernel build date suggests likely-patched, but module check fires)" ;;
+                subsystem-marker)  note=" (changelog has subsystem markers consistent with the fix; not definitive)" ;;
+            esac
+            printf '  %s%s%s exposed%s\n' "$RED" "$label" "$RESET" "$note"
+        else
+            local note="(module-based check)"
+            [[ "$evidence" == "changelog" ]] && note="(kernel changelog confirms patch)"
+            printf '  %s%s%s not exposed %s\n' "$GREEN" "$label" "$RESET" "$note"
+        fi
+    }
+    print_verdict "Copy Fail  (CVE-2026-31431):" "$COPYFAIL_EXPOSED" "$COPYFAIL_PATCH_EVIDENCE"
+    print_verdict "Dirty Frag                 :" "$DIRTYFRAG_EXPOSED" "$DIRTYFRAG_PATCH_EVIDENCE"
     echo
 }
 
