@@ -4,7 +4,13 @@ info:
   name: Linux Kernel Dirty Frag — xfrm-ESP / RxRPC LPE
   author: lpe-check
   severity: high
-  description: Detects exposure to Dirty Frag
+  description: |
+    Detects exposure to Dirty Frag (no CVE assigned at time of writing), a
+    deterministic logic bug in the kernel's xfrm-ESP and RxRPC paths.
+    Combines a per-module check (esp4, esp6, rxrpc) with patch-evidence
+    heuristics (kernel changelog references and build date) to reduce
+    false positives when a distro backports the fix without removing the
+    vulnerable module.
   classification:
     cvss-score: 7.8
     cvss-metrics: CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H
@@ -19,6 +25,7 @@ code:
       kernel="$(uname -r)"
       any_vulnerable=0
       report=""
+
       check_module() {
         mod="$1"
         [ -d "/sys/module/$mod" ] && loaded=1 || loaded=0
@@ -48,16 +55,78 @@ code:
       check_module esp4
       check_module esp6
       check_module rxrpc
+
       ipsec_active=no
       if command -v ip >/dev/null 2>&1; then
         if [ -n "$(ip xfrm state 2>/dev/null)" ]; then
           ipsec_active=yes
         fi
       fi
-      if [ "$any_vulnerable" = "1" ]; then
-        echo "STATUS=VULNERABLE kernel=$kernel ipsec_active=$ipsec_active ${report}"
+
+      # --- patch evidence (false-positive reduction) ---
+      # Dirty Frag has no CVE assigned at time of writing, so HIGH-confidence
+      # matching keys off the disclosure name, the discoverer, and the
+      # discoverer's GitHub repo path. Add the CVE ID once assigned.
+      #
+      #   HIGH   (overrides verdict): disclosure name / discoverer / repo path.
+      #   MEDIUM (does NOT override): MSG_SPLICE_PAGES + esp/rxrpc — strongly
+      #                               correlated with this fix but could match
+      #                               an unrelated commit touching the same files.
+      #   LOW    (does NOT override): kernel built on/after 2026-05-21
+      #                               (disclosure 2026-05-07 + 14d).
+      changelog_mentions() {
+        needle="$1"
+        for loc in \
+          "/usr/share/doc/linux-image-$kernel/changelog.Debian.gz" \
+          "/usr/share/doc/linux-image-$kernel/changelog.gz" \
+          "/usr/share/doc/linux-image-unsigned-$kernel/changelog.Debian.gz" \
+          "/usr/share/doc/linux-modules-$kernel/changelog.Debian.gz" \
+        ; do
+          if [ -r "$loc" ]; then
+            zcat -- "$loc" 2>/dev/null | grep -qiF -- "$needle" && return 0
+          fi
+        done
+        if command -v rpm >/dev/null 2>&1; then
+          for pkg in "kernel-$kernel" "kernel-core-$kernel" "kernel-default-$kernel"; do
+            rpm -q --changelog -- "$pkg" 2>/dev/null | grep -qiF -- "$needle" && return 0
+          done
+        fi
+        return 1
+      }
+      built_on_or_after() {
+        target_epoch="$(date -d "$1" +%s 2>/dev/null)"
+        [ -n "$target_epoch" ] || return 1
+        date_str="$(uname -v 2>/dev/null | grep -oE '(Sun|Mon|Tue|Wed|Thu|Fri|Sat) .*')"
+        [ -n "$date_str" ] || return 1
+        build_epoch="$(date -d "$date_str" +%s 2>/dev/null)"
+        [ -n "$build_epoch" ] || return 1
+        [ "$build_epoch" -ge "$target_epoch" ]
+      }
+
+      patch_evidence=none
+      if   changelog_mentions "dirty frag" \
+        || changelog_mentions "dirty-frag" \
+        || changelog_mentions "dirtyfrag" \
+        || changelog_mentions "v4bel/dirtyfrag" \
+        || changelog_mentions "Hyunwoo Kim"; then
+        patch_evidence=changelog
+      elif changelog_mentions "MSG_SPLICE_PAGES" \
+        && (   changelog_mentions "esp4" \
+            || changelog_mentions "esp6" \
+            || changelog_mentions "rxrpc" ); then
+        patch_evidence=subsystem-marker
+      elif built_on_or_after "2026-05-21"; then
+        patch_evidence=build-date
+      fi
+
+      # HIGH-confidence changelog evidence overrides the module-based verdict.
+      # subsystem-marker and build-date are reported but do NOT override.
+      if [ "$any_vulnerable" = "1" ] && [ "$patch_evidence" = "changelog" ]; then
+        echo "STATUS=NOT_AFFECTED kernel=$kernel ipsec_active=$ipsec_active patch_evidence=changelog ${report}"
+      elif [ "$any_vulnerable" = "1" ]; then
+        echo "STATUS=VULNERABLE kernel=$kernel ipsec_active=$ipsec_active patch_evidence=$patch_evidence ${report}"
       else
-        echo "STATUS=NOT_AFFECTED kernel=$kernel ipsec_active=$ipsec_active ${report}"
+        echo "STATUS=NOT_AFFECTED kernel=$kernel ipsec_active=$ipsec_active patch_evidence=$patch_evidence ${report}"
       fi
     matchers:
       - type: word
@@ -71,3 +140,7 @@ code:
         name: vulnerable_modules
         regex:
           - "MODULE=\\w+ state=\\w+( blacklisted=\\w+)?"
+      - type: regex
+        name: patch_evidence
+        regex:
+          - "patch_evidence=\\S+"
